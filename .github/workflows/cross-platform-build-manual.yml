@@ -84,18 +84,16 @@ jobs:
   build-musl:
     name: Build ${{ matrix.target }} (musl)
     needs: [web]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - runner: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            platform: linux/amd64
-          - os: ubuntu-latest
+          - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            platform: linux/arm64
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -104,15 +102,9 @@ jobs:
           name: web-dist
           path: web/dist/
 
-      - name: Set up QEMU
-        if: matrix.platform != 'linux/amd64'
-        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
-        with:
-          platforms: ${{ matrix.platform }}
-
       - name: Build in Alpine container
         run: |
-          docker run --rm --platform ${{ matrix.platform }} \
+          docker run --rm \
             -v "${{ github.workspace }}:/build" \
             -w /build \
             -e OPENSSL_STATIC=1 \

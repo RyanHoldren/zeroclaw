@@ -727,6 +727,8 @@ struct NativeMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
@@ -1519,6 +1521,7 @@ impl OpenAiCompatibleProvider {
                                 return NativeMessage {
                                     role: "assistant".to_string(),
                                     content,
+                                    name: None,
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
                                     reasoning_content,
@@ -1534,15 +1537,43 @@ impl OpenAiCompatibleProvider {
                             .get("tool_call_id")
                             .and_then(serde_json::Value::as_str)
                             .map(ToString::to_string);
+                        let name = value
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToString::to_string);
                         let content = value
                             .get("content")
                             .and_then(serde_json::Value::as_str)
                             .map(|value| MessageContent::Text(value.to_string()))
                             .or_else(|| Some(MessageContent::Text(message.content.clone())));
 
+                        // If tool_call_id is missing (e.g., truncation corrupted
+                        // the JSON), fall back to a user message to avoid API
+                        // errors from providers that require tool_call_id.
+                        if tool_call_id.is_none() {
+                            let text = content
+                                .as_ref()
+                                .map(|c| match c {
+                                    MessageContent::Text(t) => t.clone(),
+                                    MessageContent::Parts(_) => message.content.clone(),
+                                })
+                                .unwrap_or_else(|| message.content.clone());
+                            return NativeMessage {
+                                role: "user".to_string(),
+                                content: Some(MessageContent::Text(
+                                    format!("[Tool result] {text}")
+                                )),
+                                name: None,
+                                tool_call_id: None,
+                                tool_calls: None,
+                                reasoning_content: None,
+                            };
+                        }
+
                         return NativeMessage {
                             role: "tool".to_string(),
                             content,
+                            name,
                             tool_call_id,
                             tool_calls: None,
                             reasoning_content: None,
@@ -1550,13 +1581,22 @@ impl OpenAiCompatibleProvider {
                     }
                 }
 
+                // If a role:tool message fell through (JSON parse failed,
+                // e.g., truncation broke the JSON), convert to role:user to
+                // avoid sending tool messages without tool_call_id.
+                let role = if message.role == "tool" { "user" } else { &message.role };
                 NativeMessage {
-                    role: message.role.clone(),
+                    role: role.to_string(),
                     content: Some(Self::to_message_content(
-                        &message.role,
-                        &message.content,
+                        role,
+                        &if message.role == "tool" {
+                            format!("[Tool result] {}", message.content)
+                        } else {
+                            message.content.clone()
+                        },
                         allow_user_image_parts,
                     )),
+                    name: None,
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
@@ -3062,9 +3102,80 @@ mod tests {
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
+        assert!(converted[0].name.is_none());
         assert!(matches!(
             converted[0].content.as_ref(),
             Some(MessageContent::Text(value)) if value == "done"
+        ));
+    }
+
+    #[test]
+    fn convert_messages_for_native_extracts_tool_name() {
+        let input = vec![ChatMessage::tool(
+            r#"{"tool_call_id":"call_abc","name":"shell","content":"ok"}"#,
+        )];
+
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "tool");
+        assert_eq!(converted[0].name.as_deref(), Some("shell"));
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
+    }
+
+    #[test]
+    fn convert_messages_for_native_tool_name_serialized_when_present() {
+        let msg = NativeMessage {
+            role: "tool".to_string(),
+            content: Some(MessageContent::Text("ok".to_string())),
+            name: Some("shell".to_string()),
+            tool_call_id: Some("call_1".to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains(r#""name":"shell""#),
+            "name should be serialized"
+        );
+
+        let msg_no_name = NativeMessage {
+            role: "tool".to_string(),
+            content: Some(MessageContent::Text("ok".to_string())),
+            name: None,
+            tool_call_id: Some("call_1".to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+        };
+        let json = serde_json::to_string(&msg_no_name).unwrap();
+        assert!(!json.contains("name"), "name should be omitted when None");
+    }
+
+    #[test]
+    fn convert_messages_for_native_missing_tool_call_id_falls_back_to_user() {
+        // Tool message with content but no tool_call_id
+        let input = vec![ChatMessage::tool(r#"{"content":"some result"}"#)];
+
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        assert!(converted[0].tool_call_id.is_none());
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Text(value)) if value.contains("[Tool result]")
+        ));
+    }
+
+    #[test]
+    fn convert_messages_for_native_unparseable_tool_falls_back_to_user() {
+        // Tool message with non-JSON content (e.g., truncation broke the JSON)
+        let input = vec![ChatMessage::tool("this is not json")];
+
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Text(value)) if value.contains("[Tool result]")
         ));
     }
 
@@ -3896,6 +4007,7 @@ mod tests {
         let msg_without = NativeMessage {
             role: "assistant".to_string(),
             content: Some(MessageContent::Text("hi".to_string())),
+            name: None,
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
@@ -3909,6 +4021,7 @@ mod tests {
         let msg_with = NativeMessage {
             role: "assistant".to_string(),
             content: Some(MessageContent::Text("hi".to_string())),
+            name: None,
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),

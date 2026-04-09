@@ -2934,7 +2934,7 @@ pub(crate) async fn run_tool_call_loop(
         // When multiple tool calls are present and interactive CLI approval is not needed, run
         // tool executions concurrently for lower wall-clock latency.
         let mut tool_results = String::new();
-        let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
+        let mut individual_results: Vec<(String, Option<String>, String)> = Vec::new();
         let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
             (0..tool_calls.len()).map(|_| None).collect();
         let allow_parallel_execution = should_execute_tools_in_parallel(&tool_calls, approval);
@@ -3284,7 +3284,7 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             let result_output = truncate_tool_result(&outcome.output, max_tool_result_chars);
-            individual_results.push((tool_call_id, result_output.clone()));
+            individual_results.push((tool_name.clone(), tool_call_id, result_output.clone()));
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
@@ -3349,11 +3349,12 @@ pub(crate) async fn run_tool_call_loop(
                 && !individual_results.is_empty()
                 && individual_results
                     .iter()
-                    .all(|(tool_call_id, _)| tool_call_id.is_some());
+                    .all(|(_, tool_call_id, _)| tool_call_id.is_some());
             if all_results_have_ids {
-                for (tool_call_id, result) in &individual_results {
+                for (name, tool_call_id, result) in &individual_results {
                     let tool_msg = serde_json::json!({
                         "tool_call_id": tool_call_id,
+                        "name": name,
                         "content": result,
                     });
                     history.push(ChatMessage::tool(tool_msg.to_string()));
@@ -3362,11 +3363,12 @@ pub(crate) async fn run_tool_call_loop(
                 history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
             }
         } else {
-            for (native_call, (_, result)) in
+            for (native_call, (name, _, result)) in
                 native_tool_calls.iter().zip(individual_results.iter())
             {
                 let tool_msg = serde_json::json!({
                     "tool_call_id": native_call.id,
+                    "name": name,
                     "content": result,
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));

@@ -1536,6 +1536,7 @@ impl OpenAiCompatibleProvider {
                         let tool_call_id = value
                             .get("tool_call_id")
                             .and_then(serde_json::Value::as_str)
+                            .filter(|id| !id.is_empty())
                             .map(ToString::to_string);
                         let name = value
                             .get("name")
@@ -3154,6 +3155,23 @@ mod tests {
     fn convert_messages_for_native_missing_tool_call_id_falls_back_to_user() {
         // Tool message with content but no tool_call_id
         let input = vec![ChatMessage::tool(r#"{"content":"some result"}"#)];
+
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        assert!(converted[0].tool_call_id.is_none());
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Text(value)) if value.contains("[Tool result]")
+        ));
+    }
+
+    #[test]
+    fn convert_messages_for_native_empty_tool_call_id_falls_back_to_user() {
+        // Tool message with empty-string tool_call_id (some providers return "")
+        let input = vec![ChatMessage::tool(
+            r#"{"tool_call_id":"","name":"shell","content":"some result"}"#,
+        )];
 
         let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
         assert_eq!(converted.len(), 1);

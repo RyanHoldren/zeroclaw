@@ -2215,9 +2215,21 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             let messages = effective_messages
                 .iter()
-                .map(|message| Message {
-                    role: message.role.clone(),
-                    content: Self::to_message_content(&message.role, &message.content, !merge),
+                .map(|message| {
+                    // Convert role:tool to role:user in non-tool requests —
+                    // history may contain tool results from prior turns, but
+                    // without tool_calls in the request, providers reject
+                    // role:tool messages.
+                    let role = if message.role == "tool" { "user" } else { &message.role };
+                    let content = if message.role == "tool" {
+                        Self::to_message_content(role, &format!("[Tool result] {}", message.content), !merge)
+                    } else {
+                        Self::to_message_content(role, &message.content, !merge)
+                    };
+                    Message {
+                        role: role.to_string(),
+                        content,
+                    }
                 })
                 .collect();
 

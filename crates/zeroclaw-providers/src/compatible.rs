@@ -737,6 +737,8 @@ struct NativeMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
@@ -1527,6 +1529,7 @@ impl OpenAiCompatibleProvider {
                     return NativeMessage {
                         role: "assistant".to_string(),
                         content,
+                        name: None,
                         tool_call_id: None,
                         tool_calls: Some(tool_calls),
                         reasoning_content,
@@ -1539,6 +1542,11 @@ impl OpenAiCompatibleProvider {
                     let tool_call_id = value
                         .get("tool_call_id")
                         .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(ToString::to_string);
+                    let name = value
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
                         .map(ToString::to_string);
                     let content = value
                         .get("content")
@@ -1546,22 +1554,56 @@ impl OpenAiCompatibleProvider {
                         .map(|value| MessageContent::Text(value.to_string()))
                         .or_else(|| Some(MessageContent::Text(message.content.clone())));
 
+                    // If tool_call_id is missing or empty (e.g., context
+                    // compressor truncated the JSON, or the provider returned
+                    // an empty ID), fall back to a user message to avoid API
+                    // errors from providers that require tool_call_id.
+                    if tool_call_id.is_none() {
+                        let text = content
+                            .as_ref()
+                            .map(|c| match c {
+                                MessageContent::Text(t) => t.clone(),
+                                MessageContent::Parts(_) => message.content.clone(),
+                            })
+                            .unwrap_or_else(|| message.content.clone());
+                        return NativeMessage {
+                            role: "user".to_string(),
+                            content: Some(MessageContent::Text(
+                                format!("[Tool result] {text}")
+                            )),
+                            name: None,
+                            tool_call_id: None,
+                            tool_calls: None,
+                            reasoning_content: None,
+                        };
+                    }
+
                     return NativeMessage {
                         role: "tool".to_string(),
                         content,
+                        name,
                         tool_call_id,
                         tool_calls: None,
                         reasoning_content: None,
                     };
                 }
 
+                // If a role:tool message fell through (JSON parse failed,
+                // e.g., truncation broke the JSON), convert to role:user to
+                // avoid sending tool messages without tool_call_id.
+                let role = if message.role == "tool" { "user" } else { &message.role };
                 NativeMessage {
-                    role: message.role.clone(),
+                    role: role.to_string(),
                     content: Some(Self::to_message_content(
-                        &message.role,
-                        &message.content,
+                        role,
+                        &if message.role == "tool" {
+                            format!("[Tool result] {}", message.content)
+                        } else {
+                            message.content.clone()
+                        },
                         allow_user_image_parts,
                     )),
+                    name: None,
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
@@ -3895,6 +3937,7 @@ mod tests {
         let msg_without = NativeMessage {
             role: "assistant".to_string(),
             content: Some(MessageContent::Text("hi".to_string())),
+            name: None,
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
@@ -3908,6 +3951,7 @@ mod tests {
         let msg_with = NativeMessage {
             role: "assistant".to_string(),
             content: Some(MessageContent::Text("hi".to_string())),
+            name: None,
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),

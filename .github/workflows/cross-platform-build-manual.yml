@@ -80,3 +80,52 @@ jobs:
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
           cargo build --release --locked --features channel-matrix,channel-lark --target ${{ matrix.target }}
+
+  build-musl:
+    name: Build ${{ matrix.target }} (musl)
+    needs: [web]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - name: Build in Alpine container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/build" \
+            -w /build \
+            -e OPENSSL_STATIC=1 \
+            -e CARGO_TERM_COLOR=always \
+            rust:1-alpine sh -c '
+              apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf git perl build-base
+              # channel-matrix excluded: matrix-sdk hits the compiler recursion limit under Alpine
+              cargo build --release --locked --features channel-lark
+            '
+
+      - name: Verify binary
+        run: |
+          file target/release/zeroclaw
+          ls -lh target/release/zeroclaw
+
+      - name: Package
+        run: |
+          tar czf zeroclaw-${{ matrix.target }}.tar.gz -C target/release zeroclaw -C ../../ web/dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-${{ matrix.target }}
+          path: zeroclaw-${{ matrix.target }}.tar.gz
+          retention-days: 14

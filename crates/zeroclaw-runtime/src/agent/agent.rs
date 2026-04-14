@@ -535,6 +535,16 @@ impl Agent {
             None
         };
 
+        // Load skills and register them as callable tools so WebSocket/daemon
+        // sessions can execute them (not just describe them in the prompt).
+        // The CLI path registers skills separately in loop_.rs, but
+        // Agent::turn_streamed (used by ws.rs) doesn't go through that path.
+        let skills = crate::skills::load_skills_with_config(
+            &config.workspace_dir,
+            config,
+        );
+        tools::register_skill_tools(&mut tools, &skills, security.clone());
+
         Agent::builder()
             .provider(provider)
             .tools(tools)
@@ -555,10 +565,7 @@ impl Agent {
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
             .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills_with_config(
-                &config.workspace_dir,
-                config,
-            ))
+            .skills(skills)
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .security_summary(Some(security.prompt_summary()))

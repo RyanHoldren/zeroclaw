@@ -5168,21 +5168,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Register skill-defined tools so the gateway can execute them (not just
     // describe them in the prompt). Without this, skill tools like email.send
     // appear in the system prompt but return "Unknown tool" when called.
-    let skill_count_before = built_tools.len();
     zeroclaw_runtime::tools::register_skill_tools(&mut built_tools, &skills, security.clone());
-    let skill_count_after = built_tools.len();
-    eprintln!(
-        "SKILL_DEBUG: {} skills loaded, {} tools before, {} tools after (added {})",
-        skills.len(),
-        skill_count_before,
-        skill_count_after,
-        skill_count_after - skill_count_before,
-    );
-    for tool in &built_tools {
-        if tool.name().contains('.') {
-            eprintln!("SKILL_DEBUG: registered tool: {}", tool.name());
-        }
-    }
 
     let tools_registry = Arc::new(built_tools);
 

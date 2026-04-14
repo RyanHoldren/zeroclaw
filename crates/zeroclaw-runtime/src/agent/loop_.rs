@@ -2219,22 +2219,9 @@ pub async fn run(
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
-    let tool_count_before = tools_registry.len();
     // Register skill-defined tools as callable tool specs in the tool registry
     // so the LLM can invoke them via native function calling, not just XML prompts.
     tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
-    eprintln!(
-        "SKILL_DEBUG(agent): {} skills loaded from {:?}, {} tools before, {} after",
-        skills.len(), config.workspace_dir, tool_count_before, tools_registry.len(),
-    );
-    for s in &skills {
-        eprintln!("SKILL_DEBUG(agent): skill={} tools={}", s.name, s.tools.len());
-    }
-    for t in &tools_registry {
-        if t.name().contains('.') {
-            eprintln!("SKILL_DEBUG(agent): registered tool: {}", t.name());
-        }
-    }
 
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (

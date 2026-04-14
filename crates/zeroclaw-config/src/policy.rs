@@ -1103,6 +1103,15 @@ impl SecurityPolicy {
             return false;
         }
 
+        // When the operator has explicitly opted out of all command-level
+        // restrictions (wildcard + no high-risk blocking), skip the
+        // subshell/expansion guard entirely. This allows backticks,
+        // $(), heredocs, etc. in trusted environments.
+        let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
+        if has_wildcard && !self.block_high_risk_commands {
+            return true;
+        }
+
         // Block subshell/expansion operators — these allow hiding arbitrary
         // commands inside an allowed command (e.g. `echo $(rm -rf /)`) and
         // bypassing path checks through variable indirection. The helper below

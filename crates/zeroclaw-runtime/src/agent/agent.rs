@@ -535,6 +535,22 @@ impl Agent {
             None
         };
 
+        // Filter out excluded tools (non_cli_excluded_tools). The channel
+        // orchestrator applies this, but Agent::from_config (used by ws.rs)
+        // doesn't go through that path.
+        let excluded = &config.autonomy.non_cli_excluded_tools;
+        if !excluded.is_empty() {
+            tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
+        }
+
+        // Load skills and register them as callable tools so WebSocket/daemon
+        // sessions can execute them (not just describe them in the prompt).
+        let skills = crate::skills::load_skills_with_config(
+            &config.workspace_dir,
+            config,
+        );
+        tools::register_skill_tools(&mut tools, &skills, security.clone());
+
         Agent::builder()
             .provider(provider)
             .tools(tools)
@@ -555,10 +571,7 @@ impl Agent {
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
             .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills_with_config(
-                &config.workspace_dir,
-                config,
-            ))
+            .skills(skills)
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .security_summary(Some(security.prompt_summary()))

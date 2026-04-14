@@ -5171,8 +5171,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let skill_count_before = built_tools.len();
     zeroclaw_runtime::tools::register_skill_tools(&mut built_tools, &skills, security.clone());
     let skill_count_after = built_tools.len();
-    tracing::info!(
-        "Skill registration: {} skills loaded, {} tools before, {} tools after (added {})",
+    eprintln!(
+        "SKILL_DEBUG: {} skills loaded, {} tools before, {} tools after (added {})",
         skills.len(),
         skill_count_before,
         skill_count_after,
@@ -5180,7 +5180,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     );
     for tool in &built_tools {
         if tool.name().contains('.') {
-            tracing::info!("  Registered skill tool: {}", tool.name());
+            eprintln!("SKILL_DEBUG: registered tool: {}", tool.name());
         }
     }
 

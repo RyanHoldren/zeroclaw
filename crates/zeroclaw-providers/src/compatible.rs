@@ -606,6 +606,9 @@ struct ResponseMessage {
     /// in `reasoning_content` instead of `content`. Used as automatic fallback.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Some models (e.g. gpt-oss-120b via OpenRouter) use `reasoning` instead.
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
 }
@@ -624,8 +627,8 @@ impl ResponseMessage {
             }
         }
 
-        self.reasoning_content
-            .as_ref()
+        self.reasoning_content.as_ref()
+            .or(self.reasoning.as_ref())
             .map(|c| strip_think_tags(c))
             .filter(|c| !c.is_empty())
             .unwrap_or_default()
@@ -639,8 +642,8 @@ impl ResponseMessage {
             }
         }
 
-        self.reasoning_content
-            .as_ref()
+        self.reasoning_content.as_ref()
+            .or(self.reasoning.as_ref())
             .map(|c| strip_think_tags(c))
             .filter(|c| !c.is_empty())
     }
@@ -848,6 +851,10 @@ struct StreamDelta {
     /// Reasoning/thinking models may stream output via `reasoning_content`.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Some models (e.g. gpt-oss-120b via OpenRouter) use `reasoning` instead
+    /// of `reasoning_content` for chain-of-thought output.
+    #[serde(default)]
+    reasoning: Option<String>,
     /// Native tool-calling deltas in OpenAI chat-completions streaming format.
     #[serde(default)]
     tool_calls: Option<Vec<StreamToolCallDelta>>,
@@ -1033,8 +1040,9 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
         {
             return Ok(Some(StreamChunk::delta(content.clone())));
         }
-        if let Some(reasoning) = &choice.delta.reasoning_content
-            && !reasoning.is_empty()
+        if let Some(reasoning) = choice.delta.reasoning_content.as_ref()
+            .or(choice.delta.reasoning.as_ref())
+            .filter(|r| !r.is_empty())
         {
             return Ok(Some(StreamChunk::reasoning(reasoning.clone())));
         }

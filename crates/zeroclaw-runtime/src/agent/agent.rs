@@ -2190,7 +2190,7 @@ mod tests {
             Box::new(NamedMockTool::new("web_search")),
         ];
 
-        let excluded = vec!["shell".to_string(), "file_write".to_string()];
+        let excluded = ["shell".to_string(), "file_write".to_string()];
         tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -2206,7 +2206,7 @@ mod tests {
         ];
 
         // Exclude only "shell" — the other two should survive.
-        let excluded = vec!["shell".to_string()];
+        let excluded = ["shell".to_string()];
         tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();

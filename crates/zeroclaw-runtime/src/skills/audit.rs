@@ -546,7 +546,8 @@ fn has_markdown_suffix(target: &str) -> bool {
 }
 
 fn contains_shell_chaining(command: &str) -> bool {
-    ["&&", "||", ";", "\n", "\r", "`", "$("]
+    // Newlines are intentionally excluded — heredoc syntax requires them.
+    ["&&", "||", ";", "`", "$("]
         .iter()
         .any(|needle| command.contains(needle))
 }

@@ -2595,7 +2595,8 @@ mod tests {
                     kind: "shell".to_string(),
                     command: format!("echo {t}"),
                     args: std::collections::HashMap::new(),
-                })
+                timeout_secs: None,
+})
                 .collect(),
             prompts: vec![],
             location: None,

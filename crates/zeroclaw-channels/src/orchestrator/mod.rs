@@ -9183,7 +9183,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
-            }],
+            timeout_secs: None,
+}],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
         }];
@@ -9221,7 +9222,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
-            }],
+            timeout_secs: None,
+}],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
         }];
@@ -9269,7 +9271,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell&exec".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
-            }],
+            timeout_secs: None,
+}],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
         }];

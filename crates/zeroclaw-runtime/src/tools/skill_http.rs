@@ -216,7 +216,8 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/ping".to_string(),
             args: HashMap::new(),
-        };
+        timeout_secs: None,
+};
         let tool = SkillHttpTool::new("s", &st);
         let schema = tool.parameters_schema();
         assert!(schema["properties"].as_object().unwrap().is_empty());

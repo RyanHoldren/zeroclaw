@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
-/// Maximum execution time for a skill shell command (seconds).
+/// Default execution time for a skill shell command (seconds).
 const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -23,6 +23,7 @@ pub struct SkillShellTool {
     tool_description: String,
     command_template: String,
     args: HashMap<String, String>,
+    timeout_secs: u64,
     security: Arc<SecurityPolicy>,
 }
 
@@ -41,6 +42,7 @@ impl SkillShellTool {
             tool_description: tool.description.clone(),
             command_template: tool.command.clone(),
             args: tool.args.clone(),
+            timeout_secs: tool.timeout_secs.unwrap_or(SKILL_SHELL_TIMEOUT_SECS),
             security,
         }
     }
@@ -142,7 +144,7 @@ impl Tool for SkillShellTool {
         }
 
         let result =
-            tokio::time::timeout(Duration::from_secs(SKILL_SHELL_TIMEOUT_SECS), cmd.output()).await;
+            tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -185,7 +187,8 @@ impl Tool for SkillShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Command timed out after {SKILL_SHELL_TIMEOUT_SECS}s and was killed"
+                    "Command timed out after {}s and was killed",
+                    self.timeout_secs
                 )),
             }),
         }
@@ -220,6 +223,7 @@ mod tests {
             kind: "shell".to_string(),
             command: "lint --file {{file}} --format {{format}}".to_string(),
             args,
+            timeout_secs: None,
         }
     }
 
@@ -278,6 +282,7 @@ mod tests {
             kind: "shell".to_string(),
             command: "echo hello".to_string(),
             args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("s", &st, test_security());
         let schema = tool.parameters_schema();
@@ -294,6 +299,7 @@ mod tests {
             kind: "shell".to_string(),
             command: "echo hello-skill".to_string(),
             args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("test", &st, test_security());
         let result = tool.execute(serde_json::json!({})).await.unwrap();
@@ -308,5 +314,57 @@ mod tests {
         assert_eq!(spec.name, "my_skill.run_lint");
         assert_eq!(spec.description, "Run the linter on a file");
         assert_eq!(spec.parameters["type"], "object");
+    }
+
+    #[test]
+    fn skill_shell_tool_default_timeout() {
+        let st = SkillTool {
+            name: "t".to_string(),
+            description: "".to_string(),
+            kind: "shell".to_string(),
+            command: "true".to_string(),
+            args: HashMap::new(),
+            timeout_secs: None,
+        };
+        let tool = SkillShellTool::new("s", &st, test_security());
+        assert_eq!(tool.timeout_secs, SKILL_SHELL_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn skill_shell_tool_custom_timeout() {
+        let st = SkillTool {
+            name: "t".to_string(),
+            description: "".to_string(),
+            kind: "shell".to_string(),
+            command: "true".to_string(),
+            args: HashMap::new(),
+            timeout_secs: Some(3600),
+        };
+        let tool = SkillShellTool::new("s", &st, test_security());
+        assert_eq!(tool.timeout_secs, 3600);
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_timeout_enforced() {
+        let st = SkillTool {
+            name: "slow".to_string(),
+            description: "".to_string(),
+            kind: "shell".to_string(),
+            command: "sleep 10".to_string(),
+            args: HashMap::new(),
+            timeout_secs: Some(1),
+        };
+        let tool = SkillShellTool::new("test", &st, test_security());
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("timed out"),
+            "expected timeout message, got: {err}"
+        );
+        assert!(
+            err.contains("1s"),
+            "expected timeout duration in message, got: {err}"
+        );
     }
 }

@@ -306,6 +306,7 @@ voice-wake = ["zeroclaw-channels/voice-wake"]
 memory-postgres = ["zeroclaw-memory/memory-postgres"]
 
 # Backends and platform flags — each forwards to ONE crate
+gateway-voice-duplex = ["zeroclaw-gateway/gateway-voice-duplex"]
 observability-prometheus = [
     "zeroclaw-runtime/observability-prometheus",
     "zeroclaw-gateway/observability-prometheus",

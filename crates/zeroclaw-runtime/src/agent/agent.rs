@@ -929,6 +929,20 @@ impl Agent {
             }
         }
 
+        crate::observability::runtime_trace::record_event(
+            "tool_call_start",
+            None,
+            None,
+            Some(&self.model_name),
+            None,
+            None,
+            None,
+            serde_json::json!({
+                "tool": tool_name,
+                "arguments": crate::agent::loop_::scrub_credentials(&tool_args.to_string()),
+            }),
+        );
+
         // First try to find tool in static registry, then in activated MCP tools.
         let (result, success) =
             if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
@@ -987,6 +1001,21 @@ impl Agent {
             };
 
         let duration = start.elapsed();
+
+        crate::observability::runtime_trace::record_event(
+            "tool_call_result",
+            None,
+            None,
+            Some(&self.model_name),
+            None,
+            Some(success),
+            None,
+            serde_json::json!({
+                "tool": tool_name,
+                "duration_ms": duration.as_millis(),
+                "output": crate::agent::loop_::scrub_credentials(&result),
+            }),
+        );
 
         // ── Hook: after_tool_call (void) ─────────────────────────
         if let Some(ref hooks) = self.hook_runner {

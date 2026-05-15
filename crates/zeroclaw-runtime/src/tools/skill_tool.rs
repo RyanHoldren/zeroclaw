@@ -42,7 +42,7 @@ impl SkillShellTool {
             tool_description: tool.description.clone(),
             command_template: tool.command.clone(),
             args: tool.args.clone(),
-            timeout_secs: tool.timeout_secs.unwrap_or(SKILL_SHELL_TIMEOUT_SECS),
+            timeout_secs: tool.timeout_secs.unwrap_or(SKILL_SHELL_TIMEOUT_SECS).max(1),
             security,
         }
     }
@@ -133,6 +133,8 @@ impl Tool for SkillShellTool {
         cmd.arg("-c").arg(&command);
         cmd.current_dir(&self.security.workspace_dir);
         cmd.env_clear();
+        // Ensure the child is killed when the timeout future is dropped.
+        cmd.kill_on_drop(true);
 
         // Only pass safe environment variables
         for var in &[
@@ -366,5 +368,41 @@ mod tests {
             err.contains("1s"),
             "expected timeout duration in message, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_timeout_kills_process() {
+        let marker = std::env::temp_dir().join("zeroclaw_kill_marker_test");
+        let _ = std::fs::remove_file(&marker);
+
+        let st = SkillTool {
+            name: "slow".to_string(),
+            description: "".to_string(),
+            kind: "shell".to_string(),
+            command: format!("sleep 3 && touch {}", marker.display()),
+            args: HashMap::new(),
+            timeout_secs: Some(1),
+        };
+        let tool = SkillShellTool::new("test", &st, test_security());
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!result.success);
+
+        // Wait past the sleep duration — if the shell wasn't killed the touch will run.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(!marker.exists(), "shell process was not killed on timeout");
+    }
+
+    #[test]
+    fn skill_shell_tool_zero_timeout_clamped_to_one() {
+        let st = SkillTool {
+            name: "t".to_string(),
+            description: "".to_string(),
+            kind: "shell".to_string(),
+            command: "true".to_string(),
+            args: HashMap::new(),
+            timeout_secs: Some(0),
+        };
+        let tool = SkillShellTool::new("s", &st, test_security());
+        assert_eq!(tool.timeout_secs, 1, "zero timeout_secs must be clamped to 1");
     }
 }

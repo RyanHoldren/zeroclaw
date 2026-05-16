@@ -352,9 +352,9 @@ mod tests {
             name: "slow".to_string(),
             description: "".to_string(),
             kind: "shell".to_string(),
-            // python3 is in allowed_commands. __import__ avoids a semicolon
-            // in the -c argument, which would confuse split_unquoted_segments.
-            command: "python3 -c \"__import__('time').sleep(30)\"".to_string(),
+            // tail -f /dev/null blocks indefinitely and is allowed by the security
+            // policy (tail is in allowed_commands, /dev/null is always permitted).
+            command: "tail -f /dev/null".to_string(),
             args: HashMap::new(),
             timeout_secs: Some(1),
         };
@@ -374,28 +374,34 @@ mod tests {
 
     #[tokio::test]
     async fn skill_shell_tool_timeout_kills_process() {
-        // Use a bare filename so it resolves relative to workspace_dir (/tmp),
-        // avoiding the forbidden_path_argument check on absolute /tmp/... paths.
         const MARKER_NAME: &str = "zeroclaw_kill_marker_test";
         let marker = std::env::temp_dir().join(MARKER_NAME);
         let _ = std::fs::remove_file(&marker);
+
+        // Write a helper script that creates the marker. Using a script file
+        // (python3 /path/to/script.py) avoids the `-c` flag which is blocked
+        // by the security policy. The path resolves inside workspace_dir (/tmp).
+        let script = std::env::temp_dir().join("zeroclaw_kill_marker_script.py");
+        std::fs::write(&script, format!("open({:?}, 'w').close()\n", MARKER_NAME)).unwrap();
 
         let st = SkillTool {
             name: "slow".to_string(),
             description: "".to_string(),
             kind: "shell".to_string(),
-            // python3 is in allowed_commands; && is sh-logic so if sh is killed
-            // on timeout the marker python3 call never runs.
-            command: format!(
-                "python3 -c \"__import__('time').sleep(30)\" && python3 -c \"open('{}', 'w').close()\"",
-                MARKER_NAME
-            ),
+            // tail -f /dev/null blocks indefinitely; && means python3 only runs
+            // if sh survives the 1 s timeout (it won't when kill_on_drop fires).
+            command: format!("tail -f /dev/null && python3 {}", script.display()),
             args: HashMap::new(),
             timeout_secs: Some(1),
         };
         let tool = SkillShellTool::new("test", &st, test_security());
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("timed out"),
+            "expected timeout, got: {err}"
+        );
 
         // Give enough time for python3 to create the marker if sh wasn't killed.
         tokio::time::sleep(Duration::from_secs(4)).await;

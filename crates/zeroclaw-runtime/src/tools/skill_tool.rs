@@ -398,10 +398,7 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(!result.success);
         let err = result.error.unwrap_or_default();
-        assert!(
-            err.contains("timed out"),
-            "expected timeout, got: {err}"
-        );
+        assert!(err.contains("timed out"), "expected timeout, got: {err}");
 
         // Give enough time for python3 to create the marker if sh wasn't killed.
         tokio::time::sleep(Duration::from_secs(4)).await;

@@ -740,10 +740,11 @@ impl Provider for OpenRouterProvider {
             stream: Some(true),
         };
 
-        let payload = match serde_json::to_value(&native_request) {
+        let payload = match self.merge_extra_body(&native_request) {
             Ok(v) => v,
             Err(e) => {
-                return stream::once(async move { Err(StreamError::Json(e)) }).boxed();
+                let msg = e.to_string();
+                return stream::once(async move { Err(StreamError::Provider(msg)) }).boxed();
             }
         };
 

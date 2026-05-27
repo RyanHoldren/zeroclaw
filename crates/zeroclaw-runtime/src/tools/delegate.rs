@@ -1149,21 +1149,30 @@ impl DelegateTool {
             });
         }
 
-        let allowed = agent_config
-            .allowed_tools
-            .iter()
-            .map(|name| name.trim())
-            .filter(|name| !name.is_empty())
-            .collect::<std::collections::HashSet<_>>();
+        let wildcard = agent_config.allowed_tools.iter().any(|n| n.trim() == "*");
 
         let sub_tools: Vec<Box<dyn Tool>> = {
             let parent_tools = self.parent_tools.read();
-            parent_tools
-                .iter()
-                .filter(|tool| allowed.contains(tool.name()))
-                .filter(|tool| tool.name() != "delegate")
-                .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
-                .collect()
+            if wildcard {
+                parent_tools
+                    .iter()
+                    .filter(|tool| tool.name() != "delegate")
+                    .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
+                    .collect()
+            } else {
+                let allowed = agent_config
+                    .allowed_tools
+                    .iter()
+                    .map(|name| name.trim())
+                    .filter(|name| !name.is_empty())
+                    .collect::<std::collections::HashSet<_>>();
+                parent_tools
+                    .iter()
+                    .filter(|tool| allowed.contains(tool.name()))
+                    .filter(|tool| tool.name() != "delegate")
+                    .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
+                    .collect()
+            }
         };
 
         if sub_tools.is_empty() {
@@ -1910,6 +1919,28 @@ mod tests {
                 .unwrap_or("")
                 .contains("no executable tools")
         );
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_wildcard_allows_all_parent_tools_except_delegate() {
+        let config = agentic_config(vec!["*".to_string()], 10);
+        let parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>> = Arc::new(RwLock::new(vec![
+            Arc::new(EchoTool),
+            Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
+        ]));
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_parent_tools(parent_tools);
+
+        let provider = OneToolThenFinalProvider;
+        let result = tool
+            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .await
+            .unwrap();
+
+        // Wildcard must not error with "no executable tools"; it should run
+        // and include echo_tool while always excluding delegate.
+        assert!(result.success, "wildcard should not reject tool list");
+        assert!(result.output.contains("done"));
     }
 
     #[tokio::test]

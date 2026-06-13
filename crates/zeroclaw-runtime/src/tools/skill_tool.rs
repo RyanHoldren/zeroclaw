@@ -14,10 +14,49 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
-/// Maximum execution time for a skill shell command (seconds).
+/// Default execution time for a skill shell command when the manifest does not
+/// set `timeout_secs` (seconds). A skill may raise this via `timeout_secs` in
+/// its SKILL.toml `[[tools]]` entry — e.g. a build/deploy tool that blocks on a
+/// remote pipeline for minutes.
 const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+
+/// Drop guard that SIGKILLs the child's process group on the timeout path, so a
+/// killed skill command cannot orphan grandchildren (e.g. `git`/`cargo` spawned
+/// by a deploy tool). Disarmed after `wait` returns so it never signals a
+/// recycled PID. Mirrors the guard used by the built-in `shell` tool.
+#[cfg(unix)]
+struct ChildGroupGuard {
+    pgid: std::sync::atomic::AtomicI32,
+}
+
+#[cfg(unix)]
+impl ChildGroupGuard {
+    fn new(child_pid: Option<u32>) -> Self {
+        let pgid = child_pid.and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
+        Self {
+            pgid: std::sync::atomic::AtomicI32::new(pgid),
+        }
+    }
+
+    fn disarm(&self) {
+        self.pgid.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChildGroupGuard {
+    fn drop(&mut self) {
+        let pgid = self.pgid.load(std::sync::atomic::Ordering::Acquire);
+        if pgid <= 0 {
+            return;
+        }
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
 
 /// A tool derived from a skill's `[[tools]]` section that executes shell commands.
 pub struct SkillShellTool {
@@ -26,6 +65,9 @@ pub struct SkillShellTool {
     command_template: String,
     args: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
+    /// Resolved per-command timeout in seconds (manifest `timeout_secs`, or the
+    /// `SKILL_SHELL_TIMEOUT_SECS` default), clamped to a minimum of 1.
+    timeout_secs: u64,
 }
 
 impl SkillShellTool {
@@ -44,6 +86,10 @@ impl SkillShellTool {
             command_template: tool.command.clone(),
             args: tool.args.clone(),
             security,
+            timeout_secs: tool
+                .timeout_secs
+                .unwrap_or(SKILL_SHELL_TIMEOUT_SECS)
+                .max(1),
         }
     }
 
@@ -143,8 +189,41 @@ impl Tool for SkillShellTool {
             }
         }
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(SKILL_SHELL_TIMEOUT_SECS), cmd.output()).await;
+        // Run in its own process group so a timeout reaps the whole subtree
+        // (the `sh -c` shell and anything it spawns), not just the direct
+        // child. `kill_on_drop` is the cross-platform backstop; the
+        // `ChildGroupGuard` SIGKILLs the group on the timeout path on Unix.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.kill_on_drop(true);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to execute command: {e}")),
+                });
+            }
+        };
+
+        #[cfg(unix)]
+        let group_guard = ChildGroupGuard::new(child.id());
+
+        let wait_fut = async {
+            let output = child.wait_with_output().await?;
+            // The child exited on its own — defuse the guard so it never
+            // signals a PID the OS may have since recycled.
+            #[cfg(unix)]
+            group_guard.disarm();
+            Ok::<_, std::io::Error>(output)
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(self.timeout_secs), wait_fut).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -187,7 +266,8 @@ impl Tool for SkillShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Command timed out after {SKILL_SHELL_TIMEOUT_SECS}s and was killed"
+                    "Command timed out after {}s and was killed",
+                    self.timeout_secs
                 )),
             }),
         }
@@ -355,6 +435,7 @@ mod tests {
             args,
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
@@ -415,6 +496,7 @@ mod tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("s", &st, test_security());
         let schema = tool.parameters_schema();
@@ -433,11 +515,88 @@ mod tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("test", &st, test_security());
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[test]
+    fn skill_shell_tool_uses_default_timeout_when_unset() {
+        // `timeout_secs = None` in the manifest falls back to the 60s default.
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        assert_eq!(tool.timeout_secs, SKILL_SHELL_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn skill_shell_tool_honors_manifest_timeout() {
+        // A manifest `timeout_secs` overrides the default — this is the fix for
+        // long-running skills (e.g. `tools.deploy`) that were killed at 60s.
+        let mut st = sample_skill_tool();
+        st.timeout_secs = Some(3600);
+        let tool = SkillShellTool::new("my_skill", &st, test_security());
+        assert_eq!(tool.timeout_secs, 3600);
+    }
+
+    #[test]
+    fn skill_shell_tool_clamps_zero_timeout_to_one() {
+        // A zero timeout would fire instantly and kill every command; clamp it.
+        let mut st = sample_skill_tool();
+        st.timeout_secs = Some(0);
+        let tool = SkillShellTool::new("my_skill", &st, test_security());
+        assert_eq!(tool.timeout_secs, 1);
+    }
+
+    #[test]
+    fn skill_tool_serde_parses_timeout_secs() {
+        // The manifest field deserializes; absent it defaults to None.
+        let with = r#"
+            name = "deploy"
+            description = "Deploy"
+            kind = "shell"
+            command = "deploy"
+            timeout_secs = 3600
+        "#;
+        let st: SkillTool = toml::from_str(with).unwrap();
+        assert_eq!(st.timeout_secs, Some(3600));
+
+        let without = r#"
+            name = "deploy"
+            description = "Deploy"
+            kind = "shell"
+            command = "deploy"
+        "#;
+        let st: SkillTool = toml::from_str(without).unwrap();
+        assert_eq!(st.timeout_secs, None);
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_times_out_and_kills_process() {
+        // A command that outlives its (clamped 1s) timeout returns a timeout
+        // error rather than blocking; the process group is SIGKILLed.
+        let st = SkillTool {
+            name: "hang".to_string(),
+            description: "Hangs forever".to_string(),
+            kind: "shell".to_string(),
+            command: "sleep 30".to_string(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: Some(1),
+        };
+        let tool = SkillShellTool::new("test", &st, test_security());
+        let start = std::time::Instant::now();
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or_default().contains("timed out"),
+            "expected a timeout error, got: {:?}",
+            result.error
+        );
+        // Returned promptly after the 1s timeout, not after the 30s sleep.
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
@@ -509,6 +668,7 @@ mod tests {
             args: HashMap::new(),
             target: Some("shell".to_string()),
             locked_args: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
@@ -661,6 +821,7 @@ mod tests {
             args: HashMap::new(),
             target: Some("composio".to_string()),
             locked_args: locked.clone(),
+            timeout_secs: None,
         };
         let tool = SkillBuiltinTool::new("my_skill", &st, target, locked);
         // Caller passes only "input"; locked args provide action_name + app.
@@ -726,6 +887,7 @@ mod tests {
             args: HashMap::new(),
             target: Some(target.to_string()),
             locked_args: locked,
+            timeout_secs: None,
         }
     }
 
@@ -865,6 +1027,7 @@ mod tests {
                 args: HashMap::new(),
                 target: Some("shell".to_string()),
                 locked_args: HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec![],
             location: None,

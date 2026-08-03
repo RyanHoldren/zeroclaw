@@ -206,6 +206,139 @@ pub async fn handle_ws_chat(
 /// Gateway session key prefix to avoid collisions with channel sessions.
 const GW_SESSION_PREFIX: &str = "gw_";
 
+fn websocket_ping_interval(
+    config: &zeroclaw_config::schema::Config,
+) -> Option<tokio::time::Interval> {
+    let seconds = config.gateway.websocket_ping_interval_secs;
+    if seconds == 0 {
+        return None;
+    }
+
+    let period = Duration::from_secs(seconds);
+    let start = tokio::time::Instant::now().checked_add(period)?;
+    let mut interval = tokio::time::interval_at(start, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    Some(interval)
+}
+
+async fn tick_websocket_ping(interval: &mut Option<tokio::time::Interval>) {
+    if let Some(interval) = interval.as_mut() {
+        interval.tick().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+async fn resolve_ws_memory_handle(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> anyhow::Result<Option<Arc<dyn zeroclaw_memory::Memory>>> {
+    if config.agent(agent_alias).is_some_and(|agent| {
+        matches!(
+            agent.memory.backend,
+            zeroclaw_config::multi_agent::MemoryBackendKind::None
+        )
+    }) {
+        return Ok(None);
+    }
+
+    let api_key = config
+        .resolved_model_provider_for_agent(agent_alias)
+        .and_then(|(_, _, cfg)| cfg.api_key.clone());
+    zeroclaw_memory::create_memory_for_agent(config, agent_alias, api_key.as_deref())
+        .await
+        .map(Some)
+}
+
+async fn handle_ws_sop_frame<S>(
+    parsed: &serde_json::Value,
+    state: &AppState,
+    session_id: &str,
+    auth_subject: Option<&str>,
+    sender: &mut S,
+) -> bool
+where
+    S: SinkExt<Message> + Unpin,
+{
+    if parsed["kind"].as_str() != Some("sop") {
+        return false;
+    }
+    let run_id = parsed["run_id"].as_str().unwrap_or("").to_string();
+    let decision = match parsed["decision"].as_str().unwrap_or("") {
+        "approve" => Some(SopApprovalDecision::Approve),
+        // Thread the optional reason through, like the HTTP/CLI deny surfaces, so
+        // the ledger records it.
+        "deny" => Some(SopApprovalDecision::Deny {
+            reason: parsed["reason"].as_str().map(str::to_string),
+        }),
+        _ => None,
+    };
+    // run_id + a valid decision are both required; the let-else avoids an expect
+    // on the downstream resolve (codebase rule: no expect/unwrap in production).
+    let Some(decision) = decision.filter(|_| !run_id.is_empty()) else {
+        let err = serde_json::json!({
+            "type": "error",
+            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-sop-ws-invalid-approval"
+            ),
+            "code": "INVALID_APPROVAL_RESPONSE"
+        });
+        let _ = sender.send(Message::Text(err.to_string().into())).await;
+        return true;
+    };
+    let frame = if let Some(engine) = state.sop_engine.as_ref() {
+        let principal =
+            SopApprovalPrincipal::ws(session_id.to_string(), auth_subject.map(str::to_string));
+        // EPIC G: route through the broker (membership + quorum); with no
+        // `[sop.approval]` policy this is exactly `resolve_gate`.
+        let resolved = match engine.lock() {
+            Ok(mut g) => Some(g.resolve_via_broker(&run_id, decision, principal)),
+            Err(_) => None,
+        };
+        match resolved {
+            Some(Ok(outcome)) => {
+                let config = state.config.read();
+                zeroclaw_runtime::sop::drive_resumed_broker_action(
+                    &config,
+                    std::sync::Arc::clone(engine),
+                    state.sop_audit.clone(),
+                    &outcome,
+                );
+                serde_json::json!({
+                    "type": "sop_approval_result",
+                    "run_id": run_id,
+                    "outcome": outcome.label(),
+                })
+            }
+            Some(Err(e)) => serde_json::json!({
+                "type": "error",
+                "message": zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "cli-sop-ws-resolve-failed",
+                    &[("error", &e.to_string())],
+                ),
+                "code": "SOP_RESOLVE_FAILED"
+            }),
+            None => serde_json::json!({
+                "type": "error",
+                "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                    "cli-sop-ws-engine-lock-poisoned"
+                ),
+                "code": "SOP_LOCK_POISONED"
+            }),
+        }
+    } else {
+        serde_json::json!({
+            "type": "error",
+            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-sop-ws-subsystem-disabled"
+            ),
+            "code": "SOP_DISABLED"
+        })
+    };
+    let _ = sender.send(Message::Text(frame.to_string().into())).await;
+    true
+}
+
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
@@ -271,10 +404,21 @@ async fn handle_socket(
     // process it immediately (backward-compatible).
     let mut first_msg_fallback: Option<String> = None;
     let mut requested_cwd = session_cwd;
+    let mut ping_interval = websocket_ping_interval(&config);
 
-    if let Some(first) = receiver.next().await {
+    loop {
+        let first = tokio::select! {
+            first = receiver.next() => first,
+            _ = tick_websocket_ping(&mut ping_interval) => {
+                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+
         match first {
-            Ok(Message::Text(text)) => {
+            Some(Ok(Message::Text(text))) => {
                 if let Ok(cp) = serde_json::from_str::<ConnectParams>(&text) {
                     if cp.msg_type == "connect" {
                         debug!(
@@ -308,9 +452,16 @@ async fn handle_socket(
                     // Not parseable as ConnectParams — fall through
                     first_msg_fallback = Some(text.to_string());
                 }
+                break;
             }
-            Ok(Message::Close(_)) | Err(_) => return,
-            _ => {}
+            Some(Ok(Message::Ping(payload))) => {
+                if sender.send(Message::Pong(payload)).await.is_err() {
+                    return;
+                }
+            }
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+            Some(Ok(_)) => {}
         }
     }
 
@@ -406,6 +557,8 @@ async fn handle_socket(
                         &mut receiver,
                         &mut approval_event_rx,
                         &pending_approvals,
+                        &mut ping_interval,
+                        &ws_memory,
                         &content,
                         &session_key,
                     )
@@ -436,11 +589,23 @@ async fn handle_socket(
 
     loop {
         tokio::select! {
+            // ── Keepalive ─────────────────────────────────────────────
+            _ = tick_websocket_ping(&mut ping_interval) => {
+                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+
             // ── Client message ────────────────────────────────────────
             client_msg = receiver.next() => {
                 let Some(msg) = client_msg else { break };
                 let msg = match msg {
                     Ok(Message::Text(text)) => text,
+                    Ok(Message::Ping(payload)) => {
+                        if sender.send(Message::Pong(payload)).await.is_err() { break; }
+                        continue;
+                    }
+                    Ok(Message::Pong(_)) => continue,
                     Ok(Message::Close(_)) | Err(_) => break,
                     _ => continue,
                 };
@@ -558,6 +723,8 @@ async fn handle_socket(
                     &mut receiver,
                     &mut approval_event_rx,
                     &pending_approvals,
+                    &mut ping_interval,
+                    &ws_memory,
                     &content,
                     &session_key,
                 )
@@ -642,6 +809,8 @@ async fn process_chat_message(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
     approval_event_rx: &mut tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
     pending_approvals: &PendingApprovals,
+    ping_interval: &mut Option<tokio::time::Interval>,
+    ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
     content: &str,
     session_key: &str,
 ) {
@@ -720,14 +889,10 @@ async fn process_chat_message(
     let mut total_input_tokens: Option<u64> = None;
     let mut total_output_tokens: Option<u64> = None;
 
-    // Routes the three concurrent streams that the running turn cares about:
-    //   1. inbound `approval_response` frames from the WebSocket client,
-    //   2. `TurnEvent::ApprovalRequest` events from `WsApprovalChannel`,
-    //   3. ordinary `TurnEvent`s from the agent loop.
-    // Without the multiplexed select, the loop draining only `event_rx`
-    // would block the approval back-channel for the whole turn, so a pending
-    // tool approval could neither be sent to the client nor answered before
-    // the timeout fired.
+    // Track the most recent absolute provider-reported prompt size
+    // (replaces on each TurnEvent::Usage; not accumulated).
+    // Used for accurate context-bar rendering on the client.
+    let mut last_input_tokens: Option<u64> = None;
     let forward_fut = async {
         let mut cancel_drained = false;
         loop {
@@ -759,6 +924,14 @@ async fn process_chat_message(
                     // below can return. See #6514.
                     let text = match client_msg {
                         Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Ping(payload))) => {
+                            if sender.send(Message::Pong(payload)).await.is_err() {
+                                cancel_token.cancel();
+                                break;
+                            }
+                            continue;
+                        }
+                        Some(Ok(Message::Pong(_))) => continue,
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
                             cancel_token.cancel();
                             break;
@@ -808,7 +981,13 @@ async fn process_chat_message(
                         let _ = sender.send(Message::Text(frame.to_string().into())).await;
                     }
                 }
-                event_opt = event_rx.recv() => {
+                _ = tick_websocket_ping(ping_interval) => {
+                    if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        cancel_token.cancel();
+                        break;
+                    }
+                }
+                    event_opt = event_rx.recv() => {
                     let Some(event) = event_opt else { break };
                     let ws_msg = match event {
                         TurnEvent::Usage {
@@ -1146,6 +1325,110 @@ fn record_turn_cost(
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[tokio::test]
+    async fn websocket_ping_interval_skips_missed_ticks() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.websocket_ping_interval_secs = 1;
+
+        let interval = websocket_ping_interval(&config).expect("enabled ping interval");
+
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Skip
+        );
+    }
+
+    #[test]
+    fn websocket_ping_interval_handles_unvalidated_overflow_without_panicking() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.websocket_ping_interval_secs = u64::MAX;
+
+        assert!(websocket_ping_interval(&config).is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_chat_route_pings_before_and_preserves_the_first_client_message() {
+        use axum::{Router, routing::get};
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+        use zeroclaw_config::{
+            multi_agent::MemoryBackendKind,
+            schema::{AliasedAgentConfig, Config},
+        };
+
+        let tmp = tempfile::TempDir::new().expect("temporary config root");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("test data directory");
+        config.gateway.websocket_ping_interval_secs = 1;
+        let mut agent = AliasedAgentConfig::default();
+        agent.memory.backend = MemoryBackendKind::None;
+        config.agents.insert("web".to_string(), agent);
+
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(crate::api::test_state(config));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test gateway server");
+        });
+
+        let (mut socket, _) = connect_async(format!(
+            "ws://{address}/ws/chat?agent=web&session_id=idle-test"
+        ))
+        .await
+        .expect("chat WebSocket upgrade");
+
+        let session_start = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("session_start timeout")
+            .expect("session_start frame")
+            .expect("session_start transport");
+        assert!(matches!(session_start, ClientMessage::Text(_)));
+
+        let ping = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("idle ping timeout")
+            .expect("idle ping frame")
+            .expect("idle ping transport");
+        assert!(matches!(ping, ClientMessage::Ping(_)));
+
+        socket
+            .send(ClientMessage::Text(
+                serde_json::json!({"type": "message", "content": "hello"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("first chat message after idle ping");
+
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = socket
+                    .next()
+                    .await
+                    .expect("response frame")
+                    .expect("response transport");
+                if let ClientMessage::Text(text) = frame {
+                    break serde_json::from_str::<serde_json::Value>(&text)
+                        .expect("JSON response frame");
+                }
+            }
+        })
+        .await
+        .expect("first chat response timeout");
+
+        assert_eq!(response["code"], "NEEDS_ONBOARDING");
+        server.abort();
+    }
 
     #[test]
     fn extract_ws_token_from_authorization_header() {

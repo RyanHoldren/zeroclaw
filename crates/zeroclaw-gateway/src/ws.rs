@@ -200,6 +200,16 @@ pub async fn handle_ws_chat(
 /// Gateway session key prefix to avoid collisions with channel sessions.
 const GW_SESSION_PREFIX: &str = "gw_";
 
+fn websocket_ping_interval(
+    config: &zeroclaw_config::schema::Config,
+) -> Option<tokio::time::Interval> {
+    let seconds = config.gateway.websocket_ping_interval_secs;
+    (seconds > 0).then(|| {
+        let period = Duration::from_secs(seconds);
+        tokio::time::interval_at(tokio::time::Instant::now() + period, period)
+    })
+}
+
 async fn resolve_ws_memory_handle(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -607,14 +617,33 @@ async fn handle_socket(
     // Subscribe to the shared broadcast channel so cron/heartbeat events
     // are forwarded to this WebSocket client.
     let mut broadcast_rx = state.event_tx.subscribe();
+    let mut ping_interval = websocket_ping_interval(&config);
 
     loop {
         tokio::select! {
+            // ── Keepalive ─────────────────────────────────────────────
+            _ = async {
+                if let Some(interval) = ping_interval.as_mut() {
+                    interval.tick().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+
             // ── Client message ────────────────────────────────────────
             client_msg = receiver.next() => {
                 let Some(msg) = client_msg else { break };
                 let msg = match msg {
                     Ok(Message::Text(text)) => text,
+                    Ok(Message::Ping(payload)) => {
+                        if sender.send(Message::Pong(payload)).await.is_err() { break; }
+                        continue;
+                    }
+                    Ok(Message::Pong(_)) => continue,
                     Ok(Message::Close(_)) | Err(_) => break,
                     _ => continue,
                 };
@@ -1047,6 +1076,8 @@ async fn process_chat_message(
     // (replaces on each TurnEvent::Usage; not accumulated).
     // Used for accurate context-bar rendering on the client.
     let mut last_input_tokens: Option<u64> = None;
+    let config = state.config.read().clone();
+    let mut ping_interval = websocket_ping_interval(&config);
 
     let forward_fut = async {
         let mut cancel_drained = false;
@@ -1065,6 +1096,14 @@ async fn process_chat_message(
                 client_msg = receiver.next() => {
                     let text = match client_msg {
                         Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Ping(payload))) => {
+                            if sender.send(Message::Pong(payload)).await.is_err() {
+                                cancel_token.cancel();
+                                break;
+                            }
+                            continue;
+                        }
+                        Some(Ok(Message::Pong(_))) => continue,
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
                             cancel_token.cancel();
                             break;
@@ -1163,6 +1202,18 @@ async fn process_chat_message(
                             "timeout_secs": timeout_secs,
                         });
                         let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                    }
+                }
+                _ = async {
+                    if let Some(interval) = ping_interval.as_mut() {
+                        interval.tick().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        cancel_token.cancel();
+                        break;
                     }
                 }
                     event_opt = event_rx.recv() => {

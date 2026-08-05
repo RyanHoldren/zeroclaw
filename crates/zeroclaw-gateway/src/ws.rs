@@ -543,13 +543,19 @@ async fn handle_socket(
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
-                if !content.is_empty() {
-                    // Persist user message
-                    if let Some(ref backend) = state.session_backend {
-                        let user_msg = zeroclaw_providers::ChatMessage::user(&content);
-                        let _ = backend.append(&session_key, &user_msg);
-                    }
+                if let Some(content) = first_chat_message_content(text) {
+                    let _session_guard = match state.session_queue.acquire(&session_key).await {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            let err = serde_json::json!({
+                                "type": "error",
+                                "message": e.to_string(),
+                                "code": session_queue_ws_error_code(&e)
+                            });
+                            let _ = sender.send(Message::Text(err.to_string().into())).await;
+                            return;
+                        }
+                    };
                     process_chat_message(
                         &state,
                         &mut agent,
@@ -796,6 +802,31 @@ fn needs_onboarding_ws_error(
         "message": crate::needs_onboarding_channel_reply(),
         "url": "/onboard",
     }))
+}
+
+fn first_chat_message_content(text: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    (parsed["type"].as_str() == Some("message"))
+        .then(|| parsed["content"].as_str().unwrap_or("").to_string())
+        .filter(|content| !content.is_empty())
+}
+
+fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
+    match event.get("session_id").and_then(|value| value.as_str()) {
+        Some(event_session_id) => event_session_id == session_id,
+        None => is_global_chat_event(event),
+    }
+}
+
+fn is_global_chat_event(event: &serde_json::Value) -> bool {
+    matches!(
+        event.get("type").and_then(serde_json::Value::as_str),
+        Some("cron_result")
+    )
+}
+
+fn is_observability_telemetry(event: &serde_json::Value) -> bool {
+    event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
 }
 
 /// Process a single chat message through the agent and send the response.
@@ -1428,6 +1459,113 @@ mod tests {
 
         assert_eq!(response["code"], "NEEDS_ONBOARDING");
         server.abort();
+    }
+
+    #[test]
+    fn first_chat_message_content_preserves_the_message_for_dispatch() {
+        let text = serde_json::json!({
+            "type": "message",
+            "content": "hello after an idle keepalive"
+        })
+        .to_string();
+
+        assert_eq!(
+            first_chat_message_content(&text).as_deref(),
+            Some("hello after an idle keepalive")
+        );
+    }
+
+    #[test]
+    fn ws_turn_has_a_single_channel_identity() {
+        // Regression: `Agent.channel_name` was set to "ws" to match the
+        // back-channel registration key while the turn span still recorded
+        // `channel = "wss"`, so one turn was attributed to two channel names.
+        // All three uses now derive from WS_CHANNEL_KEY; this pins the value
+        // to the historical ingress name so observability stays stable and
+        // interactive-tool lookups still resolve.
+        assert_eq!(
+            WS_CHANNEL_KEY, "wss",
+            "WS ingress identity must stay `wss` — it is the name already used by \
+             the turn span and SSE `channel` field; changing it splits attribution"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_back_channel_registers_under_the_ingress_identity() {
+        // The interactive tools (`ask_user`, `poll`, `escalate_to_human`) look
+        // the channel up by the agent's channel name. If the registration key
+        // and WS_CHANNEL_KEY ever diverge, that lookup misses and the tools
+        // silently fall back to an arbitrary seeded channel — the original bug.
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let pending = new_pending_approvals();
+        let approval_channel = Arc::new(WsApprovalChannel::new(
+            tx,
+            pending,
+            Duration::from_secs(WS_APPROVAL_TIMEOUT_SECS),
+        ));
+
+        let handle: zeroclaw_runtime::tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+        handle.write().insert(
+            WS_CHANNEL_KEY.to_string(),
+            approval_channel as Arc<dyn zeroclaw_api::channel::Channel>,
+        );
+
+        // Interactive tools resolve the back-channel by the agent's channel
+        // name; this is the lookup `ask_user` / `poll` / `escalate_to_human`
+        // perform against their shared channel map.
+        let resolved = handle.read().get(WS_CHANNEL_KEY).cloned();
+        assert!(
+            resolved.is_some(),
+            "back-channel must be resolvable by the same key the agent reports \
+             as its channel name ({WS_CHANNEL_KEY})"
+        );
+        assert!(
+            !resolved.unwrap().supports_outbound_send(),
+            "WS approval channel must declare that `send` does not deliver, so \
+             poll/escalate_to_human fail honestly instead of reporting false success"
+        );
+    }
+
+    #[test]
+    fn restore_trim_uses_live_history_trimmed_frame_shape() {
+        let frame = history_trimmed_ws_frame(12, 3, "message limit");
+
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "type": "history_trimmed",
+                "dropped_messages": 12,
+                "kept_turns": 3,
+                "reason": "message limit",
+            })
+        );
+    }
+
+    #[test]
+    fn sop_ws_error_frames_resolve_via_fluent() {
+        // The SOP WebSocket error frames are UI-surfaced and route through the
+        // embedded en/cli.ftl. A renamed/typo'd key would silently ship the
+        // missing-key fallback `{cli-sop-ws-...}` to the browser; guard against it.
+        for key in [
+            "cli-sop-ws-invalid-approval",
+            "cli-sop-ws-engine-lock-poisoned",
+            "cli-sop-ws-subsystem-disabled",
+        ] {
+            let s = zeroclaw_runtime::i18n::get_required_cli_string(key);
+            assert!(
+                !s.starts_with('{') || !s.ends_with('}'),
+                "fluent missing-key fallback leaked for {key}: {s:?}"
+            );
+        }
+        let resolved = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-sop-ws-resolve-failed",
+            &[("error", "boom")],
+        );
+        assert!(
+            resolved.contains("boom"),
+            "the resolve-failed frame must interpolate the error: {resolved:?}"
+        );
     }
 
     #[test]
